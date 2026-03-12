@@ -1,7 +1,12 @@
+/// <reference types="@cloudflare/workers-types" />
 import type { Lock, StateAdapter } from "chat";
 import { beforeEach, describe, expect, it } from "vitest";
 import { CloudflareDOStateAdapter } from "./adapter";
 import { createCloudflareState } from "./index";
+
+// Use concrete adapter type so tests can call methods added in newer Chat SDK
+// (e.g. setIfNotExists in 4.18) even when devDependency is an older version.
+type AdapterUnderTest = CloudflareDOStateAdapter;
 
 // ---------------------------------------------------------------------------
 // Mock DO — mirrors ChatStateDO behavior using in-memory data structures.
@@ -93,6 +98,14 @@ class MockChatStateDO {
     });
   }
 
+  cacheSetIfNotExists(key: string, value: string, ttlMs?: number): boolean {
+    if (this.cacheGet(key) !== null) {
+      return false;
+    }
+    this.cacheSet(key, value, ttlMs);
+    return true;
+  }
+
   cacheDelete(key: string): void {
     this.cache.delete(key);
   }
@@ -132,7 +145,7 @@ function createMockNamespace() {
 // ---------------------------------------------------------------------------
 
 describe("CloudflareDOStateAdapter", () => {
-  let adapter: StateAdapter;
+  let adapter: AdapterUnderTest;
   let mock: ReturnType<typeof createMockNamespace>;
 
   beforeEach(async () => {
@@ -370,6 +383,22 @@ describe("CloudflareDOStateAdapter", () => {
       await new Promise((resolve) => setTimeout(resolve, 20));
 
       expect(await adapter.get("zero-ttl")).toBe("value");
+    });
+
+    it("should setIfNotExists only when key is missing or expired", async () => {
+      const set1 = await adapter.setIfNotExists("nx-key", "first");
+      expect(set1).toBe(true);
+      expect(await adapter.get("nx-key")).toBe("first");
+
+      const set2 = await adapter.setIfNotExists("nx-key", "second");
+      expect(set2).toBe(false);
+      expect(await adapter.get("nx-key")).toBe("first");
+
+      await adapter.set("expiring-nx", "old", 10);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      const set3 = await adapter.setIfNotExists("expiring-nx", "new");
+      expect(set3).toBe(true);
+      expect(await adapter.get("expiring-nx")).toBe("new");
     });
   });
 

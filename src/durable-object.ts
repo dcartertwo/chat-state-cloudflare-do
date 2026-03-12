@@ -210,6 +210,35 @@ export class ChatStateDO<TEnv = unknown> extends DurableObject<TEnv> {
     }
   }
 
+  /**
+   * Set the key only if it does not exist (or is expired). Returns true if
+   * the value was set, false if the key already existed and is not expired.
+   */
+  cacheSetIfNotExists(key: string, value: string, ttlMs?: number): boolean {
+    const now = Date.now();
+    const existing = this.sql
+      .exec(
+        "SELECT 1 FROM cache WHERE key = ? AND (expires_at IS NULL OR expires_at > ?)",
+        key,
+        now
+      )
+      .toArray();
+    if (existing.length > 0) {
+      return false;
+    }
+    const expiresAt = ttlMs ? Date.now() + ttlMs : null;
+    this.sql.exec(
+      "INSERT INTO cache (key, value, expires_at) VALUES (?, ?, ?)",
+      key,
+      value,
+      expiresAt
+    );
+    if (expiresAt != null) {
+      this.scheduleCleanupIfNeeded();
+    }
+    return true;
+  }
+
   cacheDelete(key: string): void {
     this.sql.exec("DELETE FROM cache WHERE key = ?", key);
   }

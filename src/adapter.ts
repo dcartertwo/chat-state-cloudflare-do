@@ -128,6 +128,18 @@ export class CloudflareDOStateAdapter implements StateAdapter {
     await this.stub().cacheSet(key, JSON.stringify(value), ttlMs);
   }
 
+  async setIfNotExists<T = unknown>(
+    key: string,
+    value: T,
+    ttlMs?: number
+  ): Promise<boolean> {
+    return this.stub().cacheSetIfNotExists(
+      key,
+      JSON.stringify(value),
+      ttlMs
+    );
+  }
+
   async delete(key: string): Promise<void> {
     await this.stub().cacheDelete(key);
   }
