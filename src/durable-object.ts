@@ -216,27 +216,32 @@ export class ChatStateDO<TEnv = unknown> extends DurableObject<TEnv> {
    */
   cacheSetIfNotExists(key: string, value: string, ttlMs?: number): boolean {
     const now = Date.now();
-    const existing = this.sql
-      .exec(
-        "SELECT 1 FROM cache WHERE key = ? AND (expires_at IS NULL OR expires_at > ?)",
+    const result = this.ctx.storage.transactionSync(() => {
+      const existing = this.sql
+        .exec(
+          "SELECT 1 FROM cache WHERE key = ? AND (expires_at IS NULL OR expires_at > ?)",
+          key,
+          now
+        )
+        .toArray();
+      if (existing.length > 0) {
+        return { inserted: false, expiresAt: null as number | null };
+      }
+      const expiresAt = ttlMs ? Date.now() + ttlMs : null;
+      this.sql.exec(
+        "INSERT INTO cache (key, value, expires_at) VALUES (?, ?, ?)",
         key,
-        now
-      )
-      .toArray();
-    if (existing.length > 0) {
-      return false;
-    }
-    const expiresAt = ttlMs ? Date.now() + ttlMs : null;
-    this.sql.exec(
-      "INSERT INTO cache (key, value, expires_at) VALUES (?, ?, ?)",
-      key,
-      value,
-      expiresAt
-    );
-    if (expiresAt != null) {
+        value,
+        expiresAt
+      );
+      return { inserted: true, expiresAt };
+    });
+
+    // Schedule alarm outside the transaction — same pattern as acquireLock().
+    if (result.inserted && result.expiresAt != null) {
       this.scheduleCleanupIfNeeded();
     }
-    return true;
+    return result.inserted;
   }
 
   cacheDelete(key: string): void {
