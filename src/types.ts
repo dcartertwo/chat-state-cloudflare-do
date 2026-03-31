@@ -44,12 +44,13 @@ export interface CloudflareStateOptions {
    * approximately 500–1,000 requests per second, so sharding is only
    * needed for very high-traffic bots.
    *
-   * Locks and subscriptions are per-thread, so sharding by any prefix
-   * of the thread ID is safe — operations on different threads are
-   * independent.
+   * Locks, force-release, and queue operations are per-thread, so
+   * sharding by any prefix of the thread ID is safe — operations on
+   * different threads are independent.
    *
-   * Cache operations (`get`/`set`/`delete`) always route to the default
-   * shard since their keys are not thread-scoped.
+   * Cache and list operations (`get`/`set`/`delete`,
+   * `appendToList`/`getList`) always route to the default shard since
+   * their keys are not thread-scoped.
    *
    * @example
    * ```typescript

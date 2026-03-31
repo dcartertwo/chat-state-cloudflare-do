@@ -1,6 +1,17 @@
-import type { Lock, StateAdapter } from "chat";
+import type { Lock, QueueEntry, StateAdapter } from "chat";
 import type { ChatStateDO } from "./durable-object";
 import type { CloudflareStateOptions } from "./types";
+
+function parseStoredJson<T>(raw: string, label: string): T {
+  try {
+    return JSON.parse(raw) as T;
+  } catch (error) {
+    throw new Error(
+      `CloudflareDOStateAdapter: expected JSON-encoded ${label}`,
+      { cause: error },
+    );
+  }
+}
 
 /**
  * Chat SDK state adapter backed by Cloudflare Durable Objects.
@@ -23,7 +34,7 @@ export class CloudflareDOStateAdapter implements StateAdapter {
     if (!options.namespace) {
       throw new Error(
         "CloudflareDOStateAdapter: namespace binding is required. " +
-          "Ensure the DurableObjectNamespace is bound in your wrangler configuration."
+          "Ensure the DurableObjectNamespace is bound in your wrangler configuration.",
       );
     }
     this.namespace = options.namespace;
@@ -49,25 +60,18 @@ export class CloudflareDOStateAdapter implements StateAdapter {
   private ensureConnected(): void {
     if (!this.connected) {
       throw new Error(
-        "CloudflareDOStateAdapter is not connected. Call connect() first."
+        "CloudflareDOStateAdapter is not connected. Call connect() first.",
       );
     }
   }
-
-  // -- Lifecycle -----------------------------------------------------------
 
   async connect(): Promise<void> {
     this.connected = true;
   }
 
-  // Intentionally minimal: Durable Object state is persistent and there is
-  // no connection to tear down (unlike Redis). We only flip the boolean so
-  // that subsequent calls throw until connect() is called again.
   async disconnect(): Promise<void> {
     this.connected = false;
   }
-
-  // -- Subscriptions -------------------------------------------------------
 
   async subscribe(threadId: string): Promise<void> {
     await this.stub(threadId).subscribe(threadId);
@@ -81,8 +85,6 @@ export class CloudflareDOStateAdapter implements StateAdapter {
     return this.stub(threadId).isSubscribed(threadId);
   }
 
-  // -- Locking -------------------------------------------------------------
-
   async acquireLock(threadId: string, ttlMs: number): Promise<Lock | null> {
     return this.stub(threadId).acquireLock(threadId, ttlMs);
   }
@@ -95,33 +97,67 @@ export class CloudflareDOStateAdapter implements StateAdapter {
     return this.stub(lock.threadId).extendLock(
       lock.threadId,
       lock.token,
-      ttlMs
+      ttlMs,
     );
   }
 
-  // -- Cache ---------------------------------------------------------------
-  // Cache keys are not thread-scoped, so they always route to the
-  // default shard regardless of the shardKey configuration.
-  //
-  // Note: storing `null` via set() serializes to the string "null", so
-  // get() will return `null` — indistinguishable from a cache miss. This
-  // matches the behavior of the Redis state adapter. Callers should avoid
-  // storing `null` values if they need to distinguish "exists as null"
-  // from "not found".
+  async forceReleaseLock(threadId: string): Promise<void> {
+    await this.stub(threadId).forceReleaseLock(threadId);
+  }
+
+  async appendToList(
+    key: string,
+    value: unknown,
+    options?: { maxLength?: number; ttlMs?: number },
+  ): Promise<void> {
+    await this.stub().listAppend(
+      key,
+      JSON.stringify(value),
+      options?.maxLength,
+      options?.ttlMs,
+    );
+  }
+
+  async getList<T = unknown>(key: string): Promise<T[]> {
+    const rawValues = await this.stub().listGet(key);
+    return rawValues.map((rawValue) =>
+      parseStoredJson<T>(rawValue, `list entry for key "${key}"`),
+    );
+  }
+
+  async enqueue(
+    threadId: string,
+    entry: QueueEntry,
+    maxSize: number,
+  ): Promise<number> {
+    return this.stub(threadId).queueEnqueue(
+      threadId,
+      JSON.stringify(entry),
+      maxSize,
+    );
+  }
+
+  async dequeue(threadId: string): Promise<QueueEntry | null> {
+    const rawValue = await this.stub(threadId).queueDequeue(threadId);
+    return rawValue === null
+      ? null
+      : parseStoredJson<QueueEntry>(
+          rawValue,
+          `queue entry for thread "${threadId}"`,
+        );
+  }
+
+  async queueDepth(threadId: string): Promise<number> {
+    return this.stub(threadId).queueDepth(threadId);
+  }
 
   async get<T = unknown>(key: string): Promise<T | null> {
     const raw = await this.stub().cacheGet(key);
     if (raw === null) {
       return null;
     }
-    try {
-      return JSON.parse(raw) as T;
-    } catch {
-      // Defensive: set() always JSON.stringify's, so parse should never
-      // fail through the public API. This handles values written directly
-      // to the DO's cache table outside of the adapter.
-      return raw as unknown as T;
-    }
+
+    return parseStoredJson<T>(raw, `cache value for key "${key}"`);
   }
 
   async set<T = unknown>(key: string, value: T, ttlMs?: number): Promise<void> {
@@ -131,13 +167,9 @@ export class CloudflareDOStateAdapter implements StateAdapter {
   async setIfNotExists<T = unknown>(
     key: string,
     value: T,
-    ttlMs?: number
+    ttlMs?: number,
   ): Promise<boolean> {
-    return this.stub().cacheSetIfNotExists(
-      key,
-      JSON.stringify(value),
-      ttlMs
-    );
+    return this.stub().cacheSetIfNotExists(key, JSON.stringify(value), ttlMs);
   }
 
   async delete(key: string): Promise<void> {

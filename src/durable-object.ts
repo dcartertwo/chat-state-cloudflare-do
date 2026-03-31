@@ -1,5 +1,12 @@
 import { DurableObject } from "cloudflare:workers";
 
+const LIST_KEY_PREFIX = "list:";
+const QUEUE_KEY_PREFIX = "queue:";
+
+interface QueueRow {
+  expiresAt: number;
+}
+
 /**
  * Durable Object class providing persistent state for Chat SDK.
  *
@@ -21,10 +28,6 @@ import { DurableObject } from "cloudflare:workers";
  * export { ChatStateDO } from "chat-state-cloudflare-do";
  * ```
  */
-// The TEnv generic is required by the DurableObject base class but unused
-// here — ChatStateDO doesn't access env bindings. Defaults to unknown so
-// consumers don't need to specify it. Named TEnv (not Env) to avoid
-// shadowing the common worker Env interface.
 export class ChatStateDO<TEnv = unknown> extends DurableObject<TEnv> {
   private readonly sql: SqlStorage;
 
@@ -37,8 +40,6 @@ export class ChatStateDO<TEnv = unknown> extends DurableObject<TEnv> {
     });
   }
 
-  // -- Schema migration ----------------------------------------------------
-
   private migrate(): void {
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS _schema_version (
@@ -47,9 +48,9 @@ export class ChatStateDO<TEnv = unknown> extends DurableObject<TEnv> {
     `);
 
     const row = this.sql
-      .exec<{ version: number }>(
-        "SELECT COALESCE(MAX(version), 0) as version FROM _schema_version"
-      )
+      .exec<{
+        version: number;
+      }>("SELECT COALESCE(MAX(version), 0) as version FROM _schema_version")
       .one();
 
     if (row.version < 1) {
@@ -79,12 +80,10 @@ export class ChatStateDO<TEnv = unknown> extends DurableObject<TEnv> {
     }
   }
 
-  // -- Subscriptions -------------------------------------------------------
-
   subscribe(threadId: string): void {
     this.sql.exec(
       "INSERT OR IGNORE INTO subscriptions (thread_id) VALUES (?)",
-      threadId
+      threadId,
     );
   }
 
@@ -97,32 +96,25 @@ export class ChatStateDO<TEnv = unknown> extends DurableObject<TEnv> {
       this.sql
         .exec(
           "SELECT 1 FROM subscriptions WHERE thread_id = ? LIMIT 1",
-          threadId
+          threadId,
         )
         .toArray().length > 0
     );
   }
 
-  // -- Locking -------------------------------------------------------------
-  // Wrapped in transactionSync() for explicit atomicity.
-  // DOs are single-threaded, but transactionSync makes the guarantee
-  // obvious and costs nothing.
-
   acquireLock(
     threadId: string,
-    ttlMs: number
+    ttlMs: number,
   ): { threadId: string; token: string; expiresAt: number } | null {
     const result = this.ctx.storage.transactionSync(() => {
       const now = Date.now();
 
-      // Remove expired lock for this thread
       this.sql.exec(
         "DELETE FROM locks WHERE thread_id = ? AND expires_at <= ?",
         threadId,
-        now
+        now,
       );
 
-      // Check if still locked
       const existing = this.sql
         .exec("SELECT 1 FROM locks WHERE thread_id = ? LIMIT 1", threadId)
         .toArray();
@@ -138,14 +130,12 @@ export class ChatStateDO<TEnv = unknown> extends DurableObject<TEnv> {
         "INSERT INTO locks (thread_id, token, expires_at) VALUES (?, ?, ?)",
         threadId,
         token,
-        expiresAt
+        expiresAt,
       );
 
       return { threadId, token, expiresAt };
     });
 
-    // Schedule alarm outside the transaction — setAlarm is async/fire-and-forget
-    // and should not be inside transactionSync.
     if (result) {
       this.scheduleCleanupIfNeeded();
     }
@@ -157,8 +147,12 @@ export class ChatStateDO<TEnv = unknown> extends DurableObject<TEnv> {
     this.sql.exec(
       "DELETE FROM locks WHERE thread_id = ? AND token = ?",
       threadId,
-      token
+      token,
     );
+  }
+
+  forceReleaseLock(threadId: string): void {
+    this.sql.exec("DELETE FROM locks WHERE thread_id = ?", threadId);
   }
 
   extendLock(threadId: string, token: string, ttlMs: number): boolean {
@@ -172,72 +166,41 @@ export class ChatStateDO<TEnv = unknown> extends DurableObject<TEnv> {
           now + ttlMs,
           threadId,
           token,
-          now
+          now,
         )
         .toArray();
       return rows.length > 0;
     });
   }
 
-  // -- Cache ---------------------------------------------------------------
-
   cacheGet(key: string): string | null {
-    const now = Date.now();
-    const rows = this.sql
-      .exec<{ value: string }>(
-        "SELECT value FROM cache WHERE key = ? AND (expires_at IS NULL OR expires_at > ?)",
-        key,
-        now
-      )
-      .toArray();
-    return rows.length > 0 ? rows[0].value : null;
+    return this.readCacheValue(key, Date.now());
   }
 
   cacheSet(key: string, value: string, ttlMs?: number): void {
-    // ttlMs of 0, null, or undefined means "no expiry" — matches Redis adapter
-    // behavior where falsy ttlMs persists the entry forever.
     const expiresAt = ttlMs ? Date.now() + ttlMs : null;
-    this.sql.exec(
-      "INSERT OR REPLACE INTO cache (key, value, expires_at) VALUES (?, ?, ?)",
-      key,
-      value,
-      expiresAt
-    );
-    // Only schedule alarm when we actually added an expiring entry —
-    // avoids a wasted nextExpiry() SQL scan on permanent cache writes.
+    this.upsertCacheValue(key, value, expiresAt);
+
     if (expiresAt != null) {
       this.scheduleCleanupIfNeeded();
     }
   }
 
-  /**
-   * Set the key only if it does not exist (or is expired). Returns true if
-   * the value was set, false if the key already existed and is not expired.
-   */
   cacheSetIfNotExists(key: string, value: string, ttlMs?: number): boolean {
     const now = Date.now();
     const result = this.ctx.storage.transactionSync(() => {
-      const existing = this.sql
-        .exec(
-          "SELECT 1 FROM cache WHERE key = ? AND (expires_at IS NULL OR expires_at > ?)",
-          key,
-          now
-        )
-        .toArray();
-      if (existing.length > 0) {
+      this.deleteExpiredCacheValue(key, now);
+
+      const existing = this.readCacheValue(key, now);
+      if (existing !== null) {
         return { inserted: false, expiresAt: null as number | null };
       }
-      const expiresAt = ttlMs ? Date.now() + ttlMs : null;
-      this.sql.exec(
-        "INSERT INTO cache (key, value, expires_at) VALUES (?, ?, ?)",
-        key,
-        value,
-        expiresAt
-      );
+
+      const expiresAt = ttlMs ? now + ttlMs : null;
+      this.upsertCacheValue(key, value, expiresAt);
       return { inserted: true, expiresAt };
     });
 
-    // Schedule alarm outside the transaction — same pattern as acquireLock().
     if (result.inserted && result.expiresAt != null) {
       this.scheduleCleanupIfNeeded();
     }
@@ -248,40 +211,214 @@ export class ChatStateDO<TEnv = unknown> extends DurableObject<TEnv> {
     this.sql.exec("DELETE FROM cache WHERE key = ?", key);
   }
 
-  // -- Alarm (TTL cleanup) -------------------------------------------------
+  listAppend(
+    key: string,
+    value: string,
+    maxLength?: number,
+    ttlMs?: number,
+  ): void {
+    const storageKey = this.listStorageKey(key);
+    const result = this.ctx.storage.transactionSync(() => {
+      const now = Date.now();
+      const list = this.readStringList(storageKey, now);
+      list.push(value);
 
-  // CF docs recommend catching exceptions in alarm handlers to prevent
-  // retry exhaustion (alarms only retry up to 6 times with exponential
-  // backoff). On failure we reschedule 30s out so cleanup eventually
-  // completes even after transient errors.
-  // https://developers.cloudflare.com/durable-objects/api/alarms/
+      if (maxLength !== undefined && maxLength > 0 && list.length > maxLength) {
+        list.splice(0, list.length - maxLength);
+      }
+
+      const expiresAt = ttlMs ? now + ttlMs : null;
+      this.upsertCacheValue(storageKey, JSON.stringify(list), expiresAt);
+      return expiresAt;
+    });
+
+    if (result != null) {
+      this.scheduleCleanupIfNeeded();
+    }
+  }
+
+  listGet(key: string): string[] {
+    return this.readStringList(this.listStorageKey(key), Date.now());
+  }
+
+  queueEnqueue(threadId: string, value: string, maxSize: number): number {
+    const storageKey = this.queueStorageKey(threadId);
+    const result = this.ctx.storage.transactionSync(() => {
+      const now = Date.now();
+      const queue = this.readQueue(storageKey, now);
+
+      if (queue.length >= maxSize) {
+        queue.shift();
+      }
+
+      queue.push(value);
+      const expiresAt = this.writeQueue(storageKey, queue, now);
+      return { depth: queue.length, expiresAt };
+    });
+
+    if (result.expiresAt != null) {
+      this.scheduleCleanupIfNeeded();
+    }
+
+    return result.depth;
+  }
+
+  queueDequeue(threadId: string): string | null {
+    const storageKey = this.queueStorageKey(threadId);
+    const result = this.ctx.storage.transactionSync(() => {
+      const now = Date.now();
+      const queue = this.readQueue(storageKey, now);
+      const next = queue.shift() ?? null;
+      const expiresAt = this.writeQueue(storageKey, queue, now);
+      return { next, expiresAt };
+    });
+
+    if (result.expiresAt != null) {
+      this.scheduleCleanupIfNeeded();
+    }
+
+    return result.next;
+  }
+
+  queueDepth(threadId: string): number {
+    const storageKey = this.queueStorageKey(threadId);
+
+    return this.ctx.storage.transactionSync(() => {
+      const now = Date.now();
+      const queue = this.readQueue(storageKey, now);
+      this.writeQueue(storageKey, queue, now);
+      return queue.length;
+    });
+  }
+
   async alarm(): Promise<void> {
     try {
       const now = Date.now();
       this.sql.exec("DELETE FROM locks WHERE expires_at <= ?", now);
       this.sql.exec(
         "DELETE FROM cache WHERE expires_at IS NOT NULL AND expires_at <= ?",
-        now
+        now,
       );
 
-      // Reschedule for the next expiring entry
       const next = this.nextExpiry();
       if (next != null) {
         await this.ctx.storage.setAlarm(next);
       }
     } catch (err) {
       console.error("ChatStateDO: alarm handler failed, rescheduling:", err);
-      // Reschedule in 30 seconds so cleanup retries even if we've
-      // exhausted the automatic alarm retry budget.
       await this.ctx.storage.setAlarm(Date.now() + 30_000);
     }
   }
 
-  /**
-   * Find the earliest future expiration timestamp across locks and cache.
-   * Filters out already-expired rows to avoid scheduling unnecessary
-   * immediate alarms.
-   */
+  private listStorageKey(key: string): string {
+    return `${LIST_KEY_PREFIX}${key}`;
+  }
+
+  private queueStorageKey(threadId: string): string {
+    return `${QUEUE_KEY_PREFIX}${threadId}`;
+  }
+
+  private readCacheValue(key: string, now: number): string | null {
+    const rows = this.sql
+      .exec<{
+        value: string;
+      }>(
+        "SELECT value FROM cache WHERE key = ? AND (expires_at IS NULL OR expires_at > ?)",
+        key,
+        now,
+      )
+      .toArray();
+
+    return rows.length > 0 ? rows[0].value : null;
+  }
+
+  private deleteExpiredCacheValue(key: string, now: number): void {
+    this.sql.exec(
+      "DELETE FROM cache WHERE key = ? AND expires_at IS NOT NULL AND expires_at <= ?",
+      key,
+      now,
+    );
+  }
+
+  private upsertCacheValue(
+    key: string,
+    value: string,
+    expiresAt: number | null,
+  ): void {
+    this.sql.exec(
+      "INSERT OR REPLACE INTO cache (key, value, expires_at) VALUES (?, ?, ?)",
+      key,
+      value,
+      expiresAt,
+    );
+  }
+
+  private readStringList(key: string, now: number): string[] {
+    this.deleteExpiredCacheValue(key, now);
+
+    const rawValue = this.readCacheValue(key, now);
+    if (rawValue === null) {
+      return [];
+    }
+
+    try {
+      const parsed = JSON.parse(rawValue) as unknown;
+      return Array.isArray(parsed)
+        ? parsed.filter((entry): entry is string => typeof entry === "string")
+        : [];
+    } catch {
+      return [];
+    }
+  }
+
+  private readQueue(key: string, now: number): string[] {
+    return this.readStringList(key, now).filter((entry) =>
+      this.isQueueEntryUnexpired(entry, now),
+    );
+  }
+
+  private writeQueue(key: string, queue: string[], now: number): number | null {
+    const expiresAt = this.maxQueueExpiry(queue, now);
+
+    if (queue.length === 0 || expiresAt === null) {
+      this.cacheDelete(key);
+      return null;
+    }
+
+    this.upsertCacheValue(key, JSON.stringify(queue), expiresAt);
+    return expiresAt;
+  }
+
+  private isQueueEntryUnexpired(value: string, now: number): boolean {
+    try {
+      const parsed = JSON.parse(value) as QueueRow;
+      return typeof parsed.expiresAt === "number" && parsed.expiresAt > now;
+    } catch {
+      return false;
+    }
+  }
+
+  private maxQueueExpiry(queue: string[], now: number): number | null {
+    let maxExpiry: number | null = null;
+
+    for (const entry of queue) {
+      try {
+        const parsed = JSON.parse(entry) as QueueRow;
+        if (typeof parsed.expiresAt !== "number" || parsed.expiresAt <= now) {
+          continue;
+        }
+
+        if (maxExpiry === null || parsed.expiresAt > maxExpiry) {
+          maxExpiry = parsed.expiresAt;
+        }
+      } catch {
+        continue;
+      }
+    }
+
+    return maxExpiry;
+  }
+
   private nextExpiry(): number | null {
     const now = Date.now();
     const rows = this.sql
@@ -292,7 +429,7 @@ export class ChatStateDO<TEnv = unknown> extends DurableObject<TEnv> {
           SELECT expires_at FROM cache WHERE expires_at IS NOT NULL AND expires_at > ?
         )`,
         now,
-        now
+        now,
       )
       .toArray();
     return rows.length > 0 ? rows[0].next_expiry : null;
@@ -301,8 +438,6 @@ export class ChatStateDO<TEnv = unknown> extends DurableObject<TEnv> {
   private scheduleCleanupIfNeeded(): void {
     const next = this.nextExpiry();
     if (next != null) {
-      // setAlarm is async but we intentionally fire-and-forget —
-      // CF auto-coalesces writes and flushes them atomically.
       this.ctx.storage.setAlarm(next).catch((err: unknown) => {
         console.error("ChatStateDO: failed to schedule cleanup alarm:", err);
       });
