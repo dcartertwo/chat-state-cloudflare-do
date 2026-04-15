@@ -24,12 +24,12 @@
     "clean": "rm -rf dist"
   },
   "peerDependencies": {
-    "chat": "^4.0.0"
+    "chat": "^4.26.0"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250214.0",
     "@types/node": "^25.3.2",
-    "chat": "^4.15.0",
+    "chat": "^4.26.0",
     "tsup": "^8.3.5",
     "typescript": "^5.7.2",
     "vitest": "^4.0.18"

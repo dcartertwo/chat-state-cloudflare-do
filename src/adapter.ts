@@ -1,4 +1,4 @@
-import type { Lock, StateAdapter } from "chat";
+import type { Lock, QueueEntry, StateAdapter } from "chat";
 import type { ChatStateDO } from "./durable-object";
 import type { CloudflareStateOptions } from "./types";
 
@@ -97,6 +97,57 @@ export class CloudflareDOStateAdapter implements StateAdapter {
       lock.token,
       ttlMs
     );
+  }
+
+  async forceReleaseLock(threadId: string): Promise<void> {
+    await this.stub(threadId).forceReleaseLock(threadId);
+  }
+
+  // -- Queue ---------------------------------------------------------------
+  // Thread-scoped FIFO queue for concurrency strategies (queue, debounce).
+
+  async enqueue(
+    threadId: string,
+    entry: QueueEntry,
+    maxSize: number
+  ): Promise<number> {
+    return this.stub(threadId).enqueue(
+      threadId,
+      JSON.stringify(entry),
+      maxSize
+    );
+  }
+
+  async dequeue(threadId: string): Promise<QueueEntry | null> {
+    const raw = await this.stub(threadId).dequeue(threadId);
+    if (raw === null) return null;
+    return JSON.parse(raw) as QueueEntry;
+  }
+
+  async queueDepth(threadId: string): Promise<number> {
+    return this.stub(threadId).queueDepth(threadId);
+  }
+
+  // -- Lists ---------------------------------------------------------------
+  // List keys are not thread-scoped, so they always route to the
+  // default shard regardless of the shardKey configuration.
+
+  async appendToList(
+    key: string,
+    value: unknown,
+    options?: { maxLength?: number; ttlMs?: number }
+  ): Promise<void> {
+    await this.stub().listAppend(
+      key,
+      JSON.stringify(value),
+      options?.maxLength,
+      options?.ttlMs
+    );
+  }
+
+  async getList<T = unknown>(key: string): Promise<T[]> {
+    const raw = await this.stub().listGet(key);
+    return raw.map((v: string) => JSON.parse(v) as T);
   }
 
   // -- Cache ---------------------------------------------------------------
