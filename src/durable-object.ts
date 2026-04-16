@@ -77,6 +77,34 @@ export class ChatStateDO<TEnv = unknown> extends DurableObject<TEnv> {
         INSERT INTO _schema_version (version) VALUES (1);
       `);
     }
+
+    if (row.version < 2) {
+      this.sql.exec(`
+        CREATE TABLE queue (
+          id          INTEGER PRIMARY KEY AUTOINCREMENT,
+          thread_id   TEXT NOT NULL,
+          value       TEXT NOT NULL,
+          enqueued_at INTEGER NOT NULL,
+          expires_at  INTEGER NOT NULL
+        );
+
+        CREATE INDEX idx_queue_thread ON queue(thread_id, id);
+        CREATE INDEX idx_queue_expires ON queue(expires_at);
+
+        CREATE TABLE lists (
+          id         INTEGER PRIMARY KEY AUTOINCREMENT,
+          key        TEXT NOT NULL,
+          value      TEXT NOT NULL,
+          expires_at INTEGER
+        );
+
+        CREATE INDEX idx_lists_key ON lists(key, id);
+        CREATE INDEX idx_lists_expires ON lists(expires_at)
+          WHERE expires_at IS NOT NULL;
+
+        INSERT INTO _schema_version (version) VALUES (2);
+      `);
+    }
   }
 
   // -- Subscriptions -------------------------------------------------------
@@ -179,6 +207,152 @@ export class ChatStateDO<TEnv = unknown> extends DurableObject<TEnv> {
     });
   }
 
+  forceReleaseLock(threadId: string): void {
+    this.sql.exec("DELETE FROM locks WHERE thread_id = ?", threadId);
+  }
+
+  // -- Queue ---------------------------------------------------------------
+  // Thread-scoped FIFO queue for concurrency strategies (queue, debounce).
+
+  enqueue(threadId: string, value: string, maxSize: number): number {
+    const parsed = JSON.parse(value) as { enqueuedAt: number; expiresAt: number };
+
+    const result = this.ctx.storage.transactionSync(() => {
+      this.sql.exec(
+        "INSERT INTO queue (thread_id, value, enqueued_at, expires_at) VALUES (?, ?, ?, ?)",
+        threadId,
+        value,
+        parsed.enqueuedAt,
+        parsed.expiresAt
+      );
+
+      // Trim: keep only the newest maxSize entries (highest id values)
+      this.sql.exec(
+        `DELETE FROM queue WHERE thread_id = ? AND id NOT IN (
+          SELECT id FROM queue WHERE thread_id = ? ORDER BY id DESC LIMIT ?
+        )`,
+        threadId,
+        threadId,
+        maxSize
+      );
+
+      const row = this.sql
+        .exec<{ cnt: number }>(
+          "SELECT COUNT(*) as cnt FROM queue WHERE thread_id = ?",
+          threadId
+        )
+        .one();
+      return row.cnt;
+    });
+
+    this.scheduleCleanupIfNeeded();
+    return result;
+  }
+
+  dequeue(threadId: string): string | null {
+    return this.ctx.storage.transactionSync(() => {
+      const now = Date.now();
+
+      // Remove expired entries first
+      this.sql.exec(
+        "DELETE FROM queue WHERE thread_id = ? AND expires_at <= ?",
+        threadId,
+        now
+      );
+
+      // Pop the oldest remaining entry (lowest id = FIFO)
+      const rows = this.sql
+        .exec<{ id: number; value: string }>(
+          "SELECT id, value FROM queue WHERE thread_id = ? ORDER BY id ASC LIMIT 1",
+          threadId
+        )
+        .toArray();
+
+      if (rows.length === 0) {
+        return null;
+      }
+
+      this.sql.exec("DELETE FROM queue WHERE id = ?", rows[0].id);
+      return rows[0].value;
+    });
+  }
+
+  queueDepth(threadId: string): number {
+    const row = this.sql
+      .exec<{ cnt: number }>(
+        "SELECT COUNT(*) as cnt FROM queue WHERE thread_id = ? AND expires_at > ?",
+        threadId,
+        Date.now()
+      )
+      .one();
+    return row.cnt;
+  }
+
+  // -- Lists ---------------------------------------------------------------
+  // Key-scoped ordered lists (not thread-scoped). Used for message history.
+
+  listAppend(
+    key: string,
+    value: string,
+    maxLength?: number,
+    ttlMs?: number
+  ): void {
+    const expiresAt = ttlMs ? Date.now() + ttlMs : null;
+
+    this.ctx.storage.transactionSync(() => {
+      this.sql.exec(
+        "INSERT INTO lists (key, value, expires_at) VALUES (?, ?, ?)",
+        key,
+        value,
+        expiresAt
+      );
+
+      // Refresh TTL on ALL entries for this key (matches Redis PEXPIRE behavior)
+      if (expiresAt !== null) {
+        this.sql.exec(
+          "UPDATE lists SET expires_at = ? WHERE key = ?",
+          expiresAt,
+          key
+        );
+      }
+
+      // Trim to maxLength: keep only the newest entries (highest id)
+      if (maxLength != null && maxLength > 0) {
+        this.sql.exec(
+          `DELETE FROM lists WHERE key = ? AND id NOT IN (
+            SELECT id FROM lists WHERE key = ? ORDER BY id DESC LIMIT ?
+          )`,
+          key,
+          key,
+          maxLength
+        );
+      }
+    });
+
+    if (expiresAt !== null) {
+      this.scheduleCleanupIfNeeded();
+    }
+  }
+
+  listGet(key: string): string[] {
+    const now = Date.now();
+
+    // Clean expired entries first
+    this.sql.exec(
+      "DELETE FROM lists WHERE key = ? AND expires_at IS NOT NULL AND expires_at <= ?",
+      key,
+      now
+    );
+
+    const rows = this.sql
+      .exec<{ value: string }>(
+        "SELECT value FROM lists WHERE key = ? ORDER BY id ASC",
+        key
+      )
+      .toArray();
+    return rows.map((r) => r.value);
+  }
+
   // -- Cache ---------------------------------------------------------------
 
   cacheGet(key: string): string | null {
@@ -227,6 +401,13 @@ export class ChatStateDO<TEnv = unknown> extends DurableObject<TEnv> {
       if (existing.length > 0) {
         return { inserted: false, expiresAt: null as number | null };
       }
+      // Remove any expired row that's still physically present —
+      // without this, the INSERT below would hit a PRIMARY KEY violation.
+      this.sql.exec(
+        "DELETE FROM cache WHERE key = ? AND expires_at IS NOT NULL AND expires_at <= ?",
+        key,
+        now
+      );
       const expiresAt = ttlMs ? Date.now() + ttlMs : null;
       this.sql.exec(
         "INSERT INTO cache (key, value, expires_at) VALUES (?, ?, ?)",
@@ -263,6 +444,11 @@ export class ChatStateDO<TEnv = unknown> extends DurableObject<TEnv> {
         "DELETE FROM cache WHERE expires_at IS NOT NULL AND expires_at <= ?",
         now
       );
+      this.sql.exec("DELETE FROM queue WHERE expires_at <= ?", now);
+      this.sql.exec(
+        "DELETE FROM lists WHERE expires_at IS NOT NULL AND expires_at <= ?",
+        now
+      );
 
       // Reschedule for the next expiring entry
       const next = this.nextExpiry();
@@ -278,7 +464,7 @@ export class ChatStateDO<TEnv = unknown> extends DurableObject<TEnv> {
   }
 
   /**
-   * Find the earliest future expiration timestamp across locks and cache.
+   * Find the earliest future expiration timestamp across all tables.
    * Filters out already-expired rows to avoid scheduling unnecessary
    * immediate alarms.
    */
@@ -290,7 +476,13 @@ export class ChatStateDO<TEnv = unknown> extends DurableObject<TEnv> {
           SELECT expires_at FROM locks WHERE expires_at > ?
           UNION ALL
           SELECT expires_at FROM cache WHERE expires_at IS NOT NULL AND expires_at > ?
+          UNION ALL
+          SELECT expires_at FROM queue WHERE expires_at > ?
+          UNION ALL
+          SELECT expires_at FROM lists WHERE expires_at IS NOT NULL AND expires_at > ?
         )`,
+        now,
+        now,
         now,
         now
       )

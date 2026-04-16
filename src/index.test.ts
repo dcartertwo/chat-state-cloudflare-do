@@ -24,6 +24,11 @@ class MockChatStateDO {
     string,
     { value: string; expiresAt: number | null }
   >();
+  private readonly queues = new Map<string, string[]>();
+  private readonly lists = new Map<
+    string,
+    { values: string[]; expiresAt: number | null }
+  >();
 
   subscribe(threadId: string): void {
     this.subscriptions.add(threadId);
@@ -108,6 +113,111 @@ class MockChatStateDO {
 
   cacheDelete(key: string): void {
     this.cache.delete(key);
+  }
+
+  // -- Force release lock ---------------------------------------------------
+
+  forceReleaseLock(threadId: string): void {
+    this.locks.delete(threadId);
+  }
+
+  // -- Queue ----------------------------------------------------------------
+
+  enqueue(threadId: string, value: string, maxSize: number): number {
+    let queue = this.queues.get(threadId);
+    if (!queue) {
+      queue = [];
+      this.queues.set(threadId, queue);
+    }
+
+    queue.push(value);
+
+    // Trim to maxSize (keep newest)
+    if (queue.length > maxSize) {
+      queue.splice(0, queue.length - maxSize);
+    }
+
+    return queue.length;
+  }
+
+  dequeue(threadId: string): string | null {
+    const queue = this.queues.get(threadId);
+    if (!queue || queue.length === 0) {
+      return null;
+    }
+
+    const now = Date.now();
+    // Skip expired entries
+    while (queue.length > 0) {
+      const entry = JSON.parse(queue[0]) as { expiresAt: number };
+      if (entry.expiresAt <= now) {
+        queue.shift();
+        continue;
+      }
+      const value = queue.shift()!;
+      if (queue.length === 0) {
+        this.queues.delete(threadId);
+      }
+      return value;
+    }
+
+    this.queues.delete(threadId);
+    return null;
+  }
+
+  queueDepth(threadId: string): number {
+    const queue = this.queues.get(threadId);
+    if (!queue) return 0;
+    const now = Date.now();
+    return queue.filter((v) => {
+      const entry = JSON.parse(v) as { expiresAt: number };
+      return entry.expiresAt > now;
+    }).length;
+  }
+
+  // -- Lists ----------------------------------------------------------------
+
+  listAppend(
+    key: string,
+    value: string,
+    maxLength?: number,
+    ttlMs?: number
+  ): void {
+    const expiresAt = ttlMs ? Date.now() + ttlMs : null;
+    let list = this.lists.get(key);
+
+    // Check if expired
+    if (list && list.expiresAt !== null && list.expiresAt <= Date.now()) {
+      list = undefined;
+    }
+
+    if (!list) {
+      list = { values: [], expiresAt };
+      this.lists.set(key, list);
+    }
+
+    list.values.push(value);
+    // Refresh TTL on every append
+    if (expiresAt !== null) {
+      list.expiresAt = expiresAt;
+    }
+
+    // Trim to maxLength (keep newest)
+    if (maxLength != null && maxLength > 0 && list.values.length > maxLength) {
+      list.values.splice(0, list.values.length - maxLength);
+    }
+  }
+
+  listGet(key: string): string[] {
+    const list = this.lists.get(key);
+    if (!list) return [];
+
+    if (list.expiresAt !== null && list.expiresAt <= Date.now()) {
+      this.lists.delete(key);
+      return [];
+    }
+
+    return [...list.values];
   }
 }
 
@@ -399,6 +509,183 @@ describe("CloudflareDOStateAdapter", () => {
       const set3 = await adapter.setIfNotExists("expiring-nx", "new");
       expect(set3).toBe(true);
       expect(await adapter.get("expiring-nx")).toBe("new");
+    });
+  });
+
+  // -- Force Release Lock ---------------------------------------------------
+
+  describe("forceReleaseLock", () => {
+    it("should release a lock without knowing the token", async () => {
+      const lock = await adapter.acquireLock("thread1", 5000);
+      expect(lock).not.toBeNull();
+
+      await adapter.forceReleaseLock("thread1");
+
+      // Should be able to re-acquire
+      const lock2 = await adapter.acquireLock("thread1", 5000);
+      expect(lock2).not.toBeNull();
+    });
+
+    it("should not throw when no lock exists", async () => {
+      await adapter.forceReleaseLock("non-existent");
+    });
+
+    it("should allow re-acquiring after force release", async () => {
+      await adapter.acquireLock("thread1", 5000);
+      await adapter.forceReleaseLock("thread1");
+
+      const lock = await adapter.acquireLock("thread1", 5000);
+      expect(lock).not.toBeNull();
+      expect(lock?.threadId).toBe("thread1");
+    });
+  });
+
+  // -- Queue ---------------------------------------------------------------
+
+  describe("queue operations", () => {
+    const makeEntry = (id: number, ttlMs = 60_000) => ({
+      enqueuedAt: Date.now(),
+      expiresAt: Date.now() + ttlMs,
+      message: { id } as any,
+    });
+
+    it("should enqueue and return depth", async () => {
+      const depth = await adapter.enqueue("thread1", makeEntry(1), 10);
+      expect(depth).toBe(1);
+    });
+
+    it("should enqueue multiple and return correct depth", async () => {
+      await adapter.enqueue("thread1", makeEntry(1), 10);
+      const depth = await adapter.enqueue("thread1", makeEntry(2), 10);
+      expect(depth).toBe(2);
+    });
+
+    it("should trim to maxSize keeping newest", async () => {
+      await adapter.enqueue("thread1", makeEntry(1), 2);
+      await adapter.enqueue("thread1", makeEntry(2), 2);
+      const depth = await adapter.enqueue("thread1", makeEntry(3), 2);
+      expect(depth).toBe(2);
+
+      // Oldest (1) should be gone, dequeue should return 2
+      const entry = await adapter.dequeue("thread1");
+      expect(entry?.message).toEqual({ id: 2 });
+    });
+
+    it("should dequeue in FIFO order", async () => {
+      await adapter.enqueue("thread1", makeEntry(1), 10);
+      await adapter.enqueue("thread1", makeEntry(2), 10);
+      await adapter.enqueue("thread1", makeEntry(3), 10);
+
+      const e1 = await adapter.dequeue("thread1");
+      const e2 = await adapter.dequeue("thread1");
+      const e3 = await adapter.dequeue("thread1");
+
+      expect(e1?.message).toEqual({ id: 1 });
+      expect(e2?.message).toEqual({ id: 2 });
+      expect(e3?.message).toEqual({ id: 3 });
+    });
+
+    it("should return null when queue is empty", async () => {
+      const entry = await adapter.dequeue("thread1");
+      expect(entry).toBeNull();
+    });
+
+    it("should skip expired entries on dequeue", async () => {
+      await adapter.enqueue("thread1", makeEntry(1, 10), 10); // expires in 10ms
+      await adapter.enqueue("thread1", makeEntry(2, 60_000), 10);
+
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      const entry = await adapter.dequeue("thread1");
+      expect(entry?.message).toEqual({ id: 2 });
+    });
+
+    it("should return 0 depth for empty queue", async () => {
+      const depth = await adapter.queueDepth("thread1");
+      expect(depth).toBe(0);
+    });
+
+    it("should not count expired entries in depth", async () => {
+      await adapter.enqueue("thread1", makeEntry(1, 10), 10);
+      await adapter.enqueue("thread1", makeEntry(2, 60_000), 10);
+
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      const depth = await adapter.queueDepth("thread1");
+      expect(depth).toBe(1);
+    });
+
+    it("should isolate queues across threads", async () => {
+      await adapter.enqueue("thread1", makeEntry(1), 10);
+      await adapter.enqueue("thread2", makeEntry(2), 10);
+
+      expect(await adapter.queueDepth("thread1")).toBe(1);
+      expect(await adapter.queueDepth("thread2")).toBe(1);
+
+      const e1 = await adapter.dequeue("thread1");
+      expect(e1?.message).toEqual({ id: 1 });
+    });
+  });
+
+  // -- Lists ---------------------------------------------------------------
+
+  describe("list operations", () => {
+    it("should append and get values in order", async () => {
+      await adapter.appendToList("list1", "a");
+      await adapter.appendToList("list1", "b");
+      await adapter.appendToList("list1", "c");
+
+      const values = await adapter.getList("list1");
+      expect(values).toEqual(["a", "b", "c"]);
+    });
+
+    it("should return empty array for non-existent key", async () => {
+      const values = await adapter.getList("missing");
+      expect(values).toEqual([]);
+    });
+
+    it("should trim to maxLength keeping newest", async () => {
+      await adapter.appendToList("list1", "a", { maxLength: 2 });
+      await adapter.appendToList("list1", "b", { maxLength: 2 });
+      await adapter.appendToList("list1", "c", { maxLength: 2 });
+
+      const values = await adapter.getList("list1");
+      expect(values).toEqual(["b", "c"]);
+    });
+
+    it("should expire after TTL", async () => {
+      await adapter.appendToList("list1", "a", { ttlMs: 10 });
+
+      expect(await adapter.getList("list1")).toEqual(["a"]);
+
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      expect(await adapter.getList("list1")).toEqual([]);
+    });
+
+    it("should handle various value types", async () => {
+      await adapter.appendToList("list1", { key: "value" });
+      await adapter.appendToList("list1", 42);
+      await adapter.appendToList("list1", "string");
+
+      const values = await adapter.getList("list1");
+      expect(values).toEqual([{ key: "value" }, 42, "string"]);
+    });
+
+    it("should route lists to default shard regardless of shardKey", async () => {
+      const shardedMock = createMockNamespace();
+      const sharded = createCloudflareState({
+        namespace: shardedMock.namespace as any,
+        name: "default-shard",
+        shardKey: (threadId) => threadId.split(":")[0],
+      });
+      await sharded.connect();
+
+      await sharded.appendToList("my-list", "value");
+      await sharded.getList("my-list");
+
+      // List calls should go to the named default shard
+      expect(shardedMock.nameLog).toEqual(["default-shard", "default-shard"]);
     });
   });
 
