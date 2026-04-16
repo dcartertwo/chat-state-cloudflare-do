@@ -2,6 +2,17 @@ import type { Lock, QueueEntry, StateAdapter } from "chat";
 import type { ChatStateDO } from "./durable-object";
 import type { CloudflareStateOptions } from "./types";
 
+function parseStoredJson<T>(raw: string, label: string): T {
+  try {
+    return JSON.parse(raw) as T;
+  } catch (error) {
+    throw new Error(
+      `CloudflareDOStateAdapter: expected JSON-encoded ${label}`,
+      { cause: error },
+    );
+  }
+}
+
 /**
  * Chat SDK state adapter backed by Cloudflare Durable Objects.
  *
@@ -120,8 +131,12 @@ export class CloudflareDOStateAdapter implements StateAdapter {
 
   async dequeue(threadId: string): Promise<QueueEntry | null> {
     const raw = await this.stub(threadId).dequeue(threadId);
-    if (raw === null) return null;
-    return JSON.parse(raw) as QueueEntry;
+    return raw === null
+      ? null
+      : parseStoredJson<QueueEntry>(
+          raw,
+          `queue entry for thread "${threadId}"`,
+        );
   }
 
   async queueDepth(threadId: string): Promise<number> {
@@ -147,7 +162,9 @@ export class CloudflareDOStateAdapter implements StateAdapter {
 
   async getList<T = unknown>(key: string): Promise<T[]> {
     const raw = await this.stub().listGet(key);
-    return raw.map((v: string) => JSON.parse(v) as T);
+    return raw.map((v: string) =>
+      parseStoredJson<T>(v, `list entry for key "${key}"`),
+    );
   }
 
   // -- Cache ---------------------------------------------------------------
@@ -165,14 +182,7 @@ export class CloudflareDOStateAdapter implements StateAdapter {
     if (raw === null) {
       return null;
     }
-    try {
-      return JSON.parse(raw) as T;
-    } catch {
-      // Defensive: set() always JSON.stringify's, so parse should never
-      // fail through the public API. This handles values written directly
-      // to the DO's cache table outside of the adapter.
-      return raw as unknown as T;
-    }
+    return parseStoredJson<T>(raw, `cache value for key "${key}"`);
   }
 
   async set<T = unknown>(key: string, value: T, ttlMs?: number): Promise<void> {
