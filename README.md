@@ -5,7 +5,7 @@
 [![npm downloads](https://img.shields.io/npm/dm/chat-state-cloudflare-do)](https://www.npmjs.com/package/chat-state-cloudflare-do)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
-Cloudflare Durable Objects state adapter for [Chat SDK](https://chat-sdk.dev/docs). Uses a SQLite-backed [Durable Object](https://developers.cloudflare.com/durable-objects/) for persistent subscriptions, distributed locking, and caching — with zero external dependencies beyond the Workers runtime.
+Cloudflare Durable Objects state adapter for [Chat SDK](https://chat-sdk.dev/docs). Uses a SQLite-backed [Durable Object](https://developers.cloudflare.com/durable-objects/) for persistent subscriptions, distributed locking, queueing, list-backed message history, and caching — with zero external dependencies beyond the Workers runtime.
 
 ## Installation
 
@@ -97,7 +97,7 @@ const state = createCloudflareState({
 });
 ```
 
-Locks and subscriptions are per-thread, so sharding by any prefix of the thread ID is safe. Cache operations (`get`/`set`/`delete`) always route to the default shard since their keys are not thread-scoped.
+Locks, force-release, and queue operations are per-thread, so sharding by any prefix of the thread ID is safe. Cache and list operations (`get`/`set`/`delete`, `appendToList`/`getList`) always route to the default shard since their keys are not thread-scoped.
 
 | Strategy | `shardKey` | DOs created |
 |----------|-----------|-------------|
@@ -107,11 +107,13 @@ Locks and subscriptions are per-thread, so sharding by any prefix of the thread 
 
 ## Architecture
 
-The adapter uses a single Durable Object class (`ChatStateDO`) with three SQLite tables:
+The adapter uses a single Durable Object class (`ChatStateDO`) with five SQLite tables:
 
 - **`subscriptions`** — thread IDs the bot is subscribed to
 - **`locks`** — distributed locks with token-based ownership and TTL
 - **`cache`** — key-value pairs with optional TTL
+- **`queue`** — thread-scoped FIFO queue entries with TTL for concurrency strategies
+- **`lists`** — ordered list entries for persistent message history
 
 All operations are single-threaded within a DO instance, providing distributed locking via DO atomicity rather than Lua scripts. Expired entries are cleaned up automatically via the [Alarms API](https://developers.cloudflare.com/durable-objects/api/alarms/).
 
@@ -121,6 +123,9 @@ Each method call creates a fresh DO stub. Stubs are cheap (just a JS object) and
 
 - Persistent subscriptions across deployments
 - Distributed locking via single-threaded DO atomicity
+- Lock force-release for Chat SDK lock conflict handling
+- Queue/debounce concurrency primitives
+- List-backed persistent message history
 - Key-value caching with TTL
 - Automatic TTL cleanup via Alarms
 - Optional sharding for high-traffic bots

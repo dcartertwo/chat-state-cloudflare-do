@@ -356,69 +356,33 @@ export class ChatStateDO<TEnv = unknown> extends DurableObject<TEnv> {
   // -- Cache ---------------------------------------------------------------
 
   cacheGet(key: string): string | null {
-    const now = Date.now();
-    const rows = this.sql
-      .exec<{ value: string }>(
-        "SELECT value FROM cache WHERE key = ? AND (expires_at IS NULL OR expires_at > ?)",
-        key,
-        now
-      )
-      .toArray();
-    return rows.length > 0 ? rows[0].value : null;
+    return this.readCacheValue(key, Date.now());
   }
 
   cacheSet(key: string, value: string, ttlMs?: number): void {
-    // ttlMs of 0, null, or undefined means "no expiry" — matches Redis adapter
-    // behavior where falsy ttlMs persists the entry forever.
     const expiresAt = ttlMs ? Date.now() + ttlMs : null;
-    this.sql.exec(
-      "INSERT OR REPLACE INTO cache (key, value, expires_at) VALUES (?, ?, ?)",
-      key,
-      value,
-      expiresAt
-    );
-    // Only schedule alarm when we actually added an expiring entry —
-    // avoids a wasted nextExpiry() SQL scan on permanent cache writes.
+    this.upsertCacheValue(key, value, expiresAt);
+
     if (expiresAt != null) {
       this.scheduleCleanupIfNeeded();
     }
   }
 
-  /**
-   * Set the key only if it does not exist (or is expired). Returns true if
-   * the value was set, false if the key already existed and is not expired.
-   */
   cacheSetIfNotExists(key: string, value: string, ttlMs?: number): boolean {
     const now = Date.now();
     const result = this.ctx.storage.transactionSync(() => {
-      const existing = this.sql
-        .exec(
-          "SELECT 1 FROM cache WHERE key = ? AND (expires_at IS NULL OR expires_at > ?)",
-          key,
-          now
-        )
-        .toArray();
-      if (existing.length > 0) {
+      this.deleteExpiredCacheValue(key, now);
+
+      const existing = this.readCacheValue(key, now);
+      if (existing !== null) {
         return { inserted: false, expiresAt: null as number | null };
       }
-      // Remove any expired row that's still physically present —
-      // without this, the INSERT below would hit a PRIMARY KEY violation.
-      this.sql.exec(
-        "DELETE FROM cache WHERE key = ? AND expires_at IS NOT NULL AND expires_at <= ?",
-        key,
-        now
-      );
-      const expiresAt = ttlMs ? Date.now() + ttlMs : null;
-      this.sql.exec(
-        "INSERT INTO cache (key, value, expires_at) VALUES (?, ?, ?)",
-        key,
-        value,
-        expiresAt
-      );
+
+      const expiresAt = ttlMs ? now + ttlMs : null;
+      this.upsertCacheValue(key, value, expiresAt);
       return { inserted: true, expiresAt };
     });
 
-    // Schedule alarm outside the transaction — same pattern as acquireLock().
     if (result.inserted && result.expiresAt != null) {
       this.scheduleCleanupIfNeeded();
     }
@@ -463,11 +427,40 @@ export class ChatStateDO<TEnv = unknown> extends DurableObject<TEnv> {
     }
   }
 
-  /**
-   * Find the earliest future expiration timestamp across all tables.
-   * Filters out already-expired rows to avoid scheduling unnecessary
-   * immediate alarms.
-   */
+  // -- Cache helpers (private) -----------------------------------------------
+
+  private readCacheValue(key: string, now: number): string | null {
+    const rows = this.sql
+      .exec<{ value: string }>(
+        "SELECT value FROM cache WHERE key = ? AND (expires_at IS NULL OR expires_at > ?)",
+        key,
+        now,
+      )
+      .toArray();
+    return rows.length > 0 ? rows[0].value : null;
+  }
+
+  private deleteExpiredCacheValue(key: string, now: number): void {
+    this.sql.exec(
+      "DELETE FROM cache WHERE key = ? AND expires_at IS NOT NULL AND expires_at <= ?",
+      key,
+      now,
+    );
+  }
+
+  private upsertCacheValue(
+    key: string,
+    value: string,
+    expiresAt: number | null,
+  ): void {
+    this.sql.exec(
+      "INSERT OR REPLACE INTO cache (key, value, expires_at) VALUES (?, ?, ?)",
+      key,
+      value,
+      expiresAt,
+    );
+  }
+
   private nextExpiry(): number | null {
     const now = Date.now();
     const rows = this.sql
