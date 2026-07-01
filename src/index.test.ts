@@ -229,6 +229,62 @@ class MockChatStateDO {
 function createMockNamespace() {
   const instances = new Map<string, MockChatStateDO>();
   const nameLog: string[] = [];
+  const scopedNameLog: string[] = [];
+  const getOptionsLog: unknown[] = [];
+  const jurisdictionLog: string[] = [];
+
+  const getInstance = (name: string) => {
+    if (!instances.has(name)) {
+      instances.set(name, new MockChatStateDO());
+    }
+    return instances.get(name)!;
+  };
+
+  const namespace = {
+    idFromName(name: string) {
+      nameLog.push(name);
+      return { name } as unknown as DurableObjectId;
+    },
+    getByName(name: string, options?: unknown) {
+      nameLog.push(name);
+      getOptionsLog.push(options);
+      return getInstance(name) as unknown as DurableObjectStub;
+    },
+    get(id: DurableObjectId, options?: unknown) {
+      getOptionsLog.push(options);
+      const name = (id as unknown as { name: string }).name;
+      return getInstance(name) as unknown as DurableObjectStub;
+    },
+    jurisdiction(jurisdiction: string) {
+      jurisdictionLog.push(jurisdiction);
+      return {
+        ...namespace,
+        idFromName(name: string) {
+          scopedNameLog.push(name);
+          return { name } as unknown as DurableObjectId;
+        },
+        getByName(name: string, options?: unknown) {
+          scopedNameLog.push(name);
+          getOptionsLog.push(options);
+          return getInstance(name) as unknown as DurableObjectStub;
+        },
+      } as unknown as DurableObjectNamespace;
+    },
+  } as unknown as DurableObjectNamespace;
+
+  return {
+    namespace,
+    instances,
+    nameLog,
+    scopedNameLog,
+    getOptionsLog,
+    jurisdictionLog,
+  };
+}
+
+function createLegacyMockNamespace() {
+  const instance = new MockChatStateDO();
+  const nameLog: string[] = [];
   const getOptionsLog: unknown[] = [];
 
   const namespace = {
@@ -236,18 +292,13 @@ function createMockNamespace() {
       nameLog.push(name);
       return { name } as unknown as DurableObjectId;
     },
-    get(id: DurableObjectId, options?: unknown) {
+    get(_id: DurableObjectId, options?: unknown) {
       getOptionsLog.push(options);
-      const name = (id as unknown as { name: string }).name;
-      if (!instances.has(name)) {
-        instances.set(name, new MockChatStateDO());
-      }
-      const instance = instances.get(name);
       return instance as unknown as DurableObjectStub;
     },
   } as unknown as DurableObjectNamespace;
 
-  return { namespace, instances, nameLog, getOptionsLog };
+  return { namespace, nameLog, getOptionsLog };
 }
 
 // ---------------------------------------------------------------------------
@@ -731,7 +782,7 @@ describe("CloudflareDOStateAdapter", () => {
       expect(shardedMock.instances.has("slack")).toBe(true);
     });
 
-    it("should forward locationHint to namespace.get()", async () => {
+    it("should forward locationHint to namespace.getByName()", async () => {
       const hintMock = createMockNamespace();
       const hinted = createCloudflareState({
         namespace: hintMock.namespace as any,
@@ -747,8 +798,37 @@ describe("CloudflareDOStateAdapter", () => {
     it("should not pass locationHint when not configured", async () => {
       await adapter.subscribe("thread1");
 
-      // get() is called without options when no locationHint is set
+      // getByName() is called without options when no locationHint is set
       expect(mock.getOptionsLog[0]).toBeUndefined();
+    });
+
+    it("should fall back to idFromName and get when getByName is unavailable", async () => {
+      const legacyMock = createLegacyMockNamespace();
+      const legacy = createCloudflareState({
+        namespace: legacyMock.namespace as any,
+        locationHint: "enam" as any,
+      });
+      await legacy.connect();
+
+      await legacy.subscribe("thread1");
+
+      expect(legacyMock.nameLog).toEqual(["default"]);
+      expect(legacyMock.getOptionsLog).toEqual([{ locationHint: "enam" }]);
+    });
+
+    it("should scope the namespace to a configured jurisdiction", async () => {
+      const jurisdictionMock = createMockNamespace();
+      const scoped = createCloudflareState({
+        namespace: jurisdictionMock.namespace as any,
+        jurisdiction: "us",
+      });
+      await scoped.connect();
+
+      await scoped.subscribe("thread1");
+
+      expect(jurisdictionMock.jurisdictionLog).toEqual(["us"]);
+      expect(jurisdictionMock.nameLog).toEqual([]);
+      expect(jurisdictionMock.scopedNameLog).toEqual(["default"]);
     });
 
     it("should route cache to default shard regardless of shardKey", async () => {
@@ -783,5 +863,3 @@ describe("CloudflareDOStateAdapter", () => {
     });
   });
 });
-
-

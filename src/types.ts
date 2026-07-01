@@ -1,5 +1,7 @@
 import type { ChatStateDO } from "./durable-object";
 
+export type CloudflareDOJurisdiction = "eu" | "us" | "fedramp";
+
 /**
  * Configuration for the Cloudflare Durable Objects state adapter.
  */
@@ -11,6 +13,16 @@ export interface CloudflareStateOptions {
    * @see https://developers.cloudflare.com/durable-objects/reference/data-location/
    */
   locationHint?: DurableObjectLocationHint;
+
+  /**
+   * Restrict Durable Objects to a supported data jurisdiction.
+   *
+   * Use this when state must run and persist only within a region such
+   * as the EU, United States, or FedRAMP data centers.
+   *
+   * @see https://developers.cloudflare.com/durable-objects/reference/data-location/
+   */
+  jurisdiction?: CloudflareDOJurisdiction;
 
   /**
    * Name for the DO instance. Defaults to `"default"`.

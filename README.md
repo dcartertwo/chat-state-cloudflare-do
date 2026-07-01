@@ -10,7 +10,7 @@ Cloudflare Durable Objects state adapter for [Chat SDK](https://chat-sdk.dev/doc
 ## Installation
 
 ```bash
-npm install chat chat-state-cloudflare-do
+npm install chat@^4.26 chat-state-cloudflare-do @chat-adapter/slack
 ```
 
 ## Usage
@@ -43,6 +43,7 @@ Add the Durable Object binding and migration to your `wrangler.jsonc` (recommend
 
 ```jsonc
 {
+  "observability": { "enabled": true },
   "durable_objects": {
     "bindings": [
       { "name": "CHAT_STATE", "class_name": "ChatStateDO" }
@@ -57,6 +58,9 @@ Add the Durable Object binding and migration to your `wrangler.jsonc` (recommend
 **wrangler.toml**
 
 ```toml
+[observability]
+enabled = true
+
 [durable_objects]
 bindings = [
   { name = "CHAT_STATE", class_name = "ChatStateDO" }
@@ -85,6 +89,24 @@ interface Env {
 | `name` | `string` | No | `"default"` | Name for the DO instance |
 | `shardKey` | `(threadId: string) => string` | No | — | Function to derive a shard name from a thread ID |
 | `locationHint` | `DurableObjectLocationHint` | No | — | [Location hint](https://developers.cloudflare.com/durable-objects/reference/data-location/) for DO placement |
+| `jurisdiction` | `"eu" \| "us" \| "fedramp"` | No | — | Restrict DO compute and storage to a [jurisdiction](https://developers.cloudflare.com/durable-objects/reference/data-location/#restrict-durable-objects-to-a-jurisdiction) |
+
+## Data jurisdiction
+
+Use `jurisdiction` when chat state must run and persist inside a supported region:
+
+```typescript
+const state = createCloudflareState({
+  namespace: env.CHAT_STATE,
+  jurisdiction: "us",
+});
+```
+
+Jurisdictions are stronger than `locationHint`: a jurisdiction restricts where the Durable Object can run and store data, while a location hint only influences first placement for latency.
+
+Choose a jurisdiction before first production use. Unscoped Durable Objects and jurisdiction-scoped Durable Objects have distinct identities: the same `name` or `shardKey` value maps to different objects in `eu`, `us`, and `fedramp`. Enabling or changing `jurisdiction` on an existing deployment starts reading from a different namespace, so existing subscriptions, locks, cache, queues, and lists will appear empty unless you plan a data migration.
+
+Note: local `workerd` testing may not enforce jurisdiction restrictions yet; verify jurisdiction behavior in a deployed Worker.
 
 ## Sharding
 
@@ -135,7 +157,8 @@ Each method call creates a fresh DO stub. Stubs are cheap (just a JS object) and
 ## Production recommendations
 
 - Use [Smart Placement](https://developers.cloudflare.com/workers/configuration/smart-placement/) to co-locate your Worker with the DO
-- Monitor DO metrics in the [Cloudflare dashboard](https://dash.cloudflare.com/)
+- Enable `observability.enabled` in Wrangler and monitor DO logs and metrics in the [Cloudflare dashboard](https://dash.cloudflare.com/)
+- Watch the DO memory usage chart for regressions after deployments
 - Enable sharding if you expect >500 req/s to a single DO instance
 - Use `locationHint` to place the DO near your primary user base
 
@@ -143,7 +166,7 @@ Each method call creates a fresh DO stub. Stubs are cheap (just a JS object) and
 
 - [npm package](https://www.npmjs.com/package/chat-state-cloudflare-do)
 - [Chat SDK docs](https://chat-sdk.dev/docs)
-- [State adapters overview](https://chat-sdk.dev/docs/state)
+- [State adapters overview](https://chat-sdk.dev/docs/state-adapters)
 - [Cloudflare Durable Objects](https://developers.cloudflare.com/durable-objects/)
 
 ## License

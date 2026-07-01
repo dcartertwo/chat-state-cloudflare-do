@@ -11,6 +11,7 @@ export default defineProject({
     },
   },
   test: {
+    include: ["src/**/*.test.ts"],
     globals: true,
     environment: "node",
     coverage: {
