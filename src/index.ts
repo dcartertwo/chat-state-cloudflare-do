@@ -1,6 +1,6 @@
 export { CloudflareDOStateAdapter } from "./adapter";
 export { ChatStateDO } from "./durable-object";
-export type { CloudflareStateOptions } from "./types";
+export type { CloudflareDOJurisdiction, CloudflareStateOptions } from "./types";
 
 import { CloudflareDOStateAdapter } from "./adapter";
 import type { CloudflareStateOptions } from "./types";

@@ -40,6 +40,8 @@ export class ChatStateDO<TEnv = unknown> extends DurableObject<TEnv> {
   // -- Schema migration ----------------------------------------------------
 
   private migrate(): void {
+    let migrated = false;
+
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS _schema_version (
         version INTEGER PRIMARY KEY
@@ -76,6 +78,7 @@ export class ChatStateDO<TEnv = unknown> extends DurableObject<TEnv> {
 
         INSERT INTO _schema_version (version) VALUES (1);
       `);
+      migrated = true;
     }
 
     if (row.version < 2) {
@@ -104,6 +107,11 @@ export class ChatStateDO<TEnv = unknown> extends DurableObject<TEnv> {
 
         INSERT INTO _schema_version (version) VALUES (2);
       `);
+      migrated = true;
+    }
+
+    if (migrated) {
+      this.sql.exec("PRAGMA optimize");
     }
   }
 

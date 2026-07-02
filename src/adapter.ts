@@ -37,7 +37,11 @@ export class CloudflareDOStateAdapter implements StateAdapter {
           "Ensure the DurableObjectNamespace is bound in your wrangler configuration."
       );
     }
-    this.namespace = options.namespace;
+    this.namespace = options.jurisdiction
+      ? options.namespace.jurisdiction(
+          options.jurisdiction as DurableObjectJurisdiction
+        )
+      : options.namespace;
     this.defaultName = options.name ?? "default";
     this.shardKey = options.shardKey;
     this.locationHint = options.locationHint;
@@ -51,10 +55,16 @@ export class CloudflareDOStateAdapter implements StateAdapter {
     this.ensureConnected();
     const name =
       threadId && this.shardKey ? this.shardKey(threadId) : this.defaultName;
+    const options = this.locationHint
+      ? { locationHint: this.locationHint }
+      : undefined;
+
+    if (typeof this.namespace.getByName === "function") {
+      return this.namespace.getByName(name, options);
+    }
+
     const id = this.namespace.idFromName(name);
-    return this.locationHint
-      ? this.namespace.get(id, { locationHint: this.locationHint })
-      : this.namespace.get(id);
+    return options ? this.namespace.get(id, options) : this.namespace.get(id);
   }
 
   private ensureConnected(): void {

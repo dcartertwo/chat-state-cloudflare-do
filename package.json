@@ -18,21 +18,29 @@
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
-    "test": "vitest run",
+    "test": "npm run test:unit && npm run test:workers",
+    "test:unit": "vitest run",
+    "test:workers": "vitest run --config vitest.workers.config.ts",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
+    "typecheck:workers": "tsc --noEmit -p tsconfig.workers-tests.json",
+    "typecheck:example": "npm --prefix example run typecheck",
     "clean": "rm -rf dist"
   },
   "peerDependencies": {
     "chat": "^4.26.0"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20250214.0",
-    "@types/node": "^25.3.2",
-    "chat": "^4.26.0",
+    "@cloudflare/vitest-pool-workers": "^0.17.0",
+    "@cloudflare/workers-types": "^4.20260701.1",
+    "@types/node": "^26.1.0",
+    "chat": "^4.32.0",
     "tsup": "^8.3.5",
-    "typescript": "^5.7.2",
-    "vitest": "^4.0.18"
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.9"
+  },
+  "overrides": {
+    "esbuild": "^0.28.1"
   },
   "repository": {
     "type": "git",

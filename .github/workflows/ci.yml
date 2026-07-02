@@ -29,8 +29,20 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      - name: Typecheck Workers tests
+        run: npm run typecheck:workers
+
       - name: Build
         run: npm run build
 
       - name: Test
         run: npm test
+
+      - name: Install example dependencies
+        run: npm --prefix example ci
+
+      - name: Typecheck example
+        run: npm run typecheck:example
+
+      - name: Audit
+        run: npm audit --audit-level=low
