@@ -18,6 +18,7 @@
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
+    "prepack": "npm run build",
     "test": "npm run test:unit && npm run test:workers",
     "test:unit": "vitest run",
     "test:workers": "vitest run --config vitest.workers.config.ts",
